@@ -54,6 +54,9 @@ class ModelParams(ParamGroup):
         self._white_background = False
         self.data_device = "cuda"
         self.eval = False
+        self.perturb = False
+        self.noise_r = 0.07
+        self.noise_t = 0.5
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

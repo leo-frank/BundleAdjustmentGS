@@ -22,6 +22,7 @@ from pathlib import Path
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
+from scene.my_utils import plot_save_poses_blender
 
 class CameraInfo(NamedTuple):
     uid: int
@@ -175,7 +176,54 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
                            ply_path=ply_path)
     return scene_info
 
-def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png"):
+def so3_to_SO3(w): # [...,3]
+    wx = skew_symmetric(w)  # 使用numpy实现的反对称矩阵
+    theta = np.linalg.norm(w, axis=-1)[..., None, None]  # 计算w的范数
+    I = np.eye(3, dtype=np.float32)  # 创建单位矩阵
+    A = taylor_A(theta)  # 使用numpy实现的泰勒展开
+    B = taylor_B(theta)  # 使用numpy实现的泰勒展开
+    R = I + A * wx + B * np.matmul(wx, wx)  # 计算旋转矩阵
+    return R
+
+def skew_symmetric(w):
+    w0, w1, w2 = np.split(w, 3, axis=-1)
+    w0 = w0.flatten()
+    w1 = w1.flatten()
+    w2 = w2.flatten()
+    O = np.zeros_like(w0)
+    wx = np.stack([np.stack([O, -w2, w1], axis=-1),
+                    np.stack([w2, O, -w0], axis=-1),
+                    np.stack([-w1, w0, O], axis=-1)], axis=-2)
+    return wx
+
+def taylor_A(x, nth=10):
+    # 使用numpy实现的泰勒展开
+    ans = np.zeros_like(x)
+    denom = 1.
+    for i in range(nth + 1):
+        if i > 0: denom *= (2 * i) * (2 * i + 1)
+        ans += (-1) ** i * x ** (2 * i) / denom
+    return ans
+
+def taylor_B(x, nth=10):
+    # 使用numpy实现的泰勒展开
+    ans = np.zeros_like(x)
+    denom = 1.
+    for i in range(nth + 1):
+        denom *= (2 * i + 1) * (2 * i + 2)
+        ans += (-1) ** i * x ** (2 * i) / denom
+    return ans
+
+def compose_pair(pose_a, pose_b):
+    # pose_new(x) = pose_b o pose_a(x)
+    R_a, t_a = pose_a[..., :3], pose_a[..., 3:]
+    R_b, t_b = pose_b[..., :3], pose_b[..., 3:]
+    R_new = np.matmul(R_b, R_a)  # 使用numpy的矩阵乘法
+    t_new = np.matmul(R_b, t_a) + t_b  # 使用numpy的矩阵乘法
+    pose_new = np.concatenate([R_new, t_new], axis=-1)  # 合并旋转矩阵和位移
+    return pose_new
+
+def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png", noise_pertub=False, noise_r=None, noise_t=None):
     cam_infos = []
 
     with open(os.path.join(path, transformsfile)) as json_file:
@@ -183,6 +231,12 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
         fovx = contents["camera_angle_x"]
 
         frames = contents["frames"]
+        if noise_pertub:
+            so3_noise = np.random.randn(len(frames), 3) * noise_r
+            t_noise = np.random.randn(len(frames), 3) * noise_t
+            pose_noise = np.concatenate([so3_to_SO3(so3_noise), t_noise[..., None]], axis=-1) # [...,3,4]
+        pose = []
+        pose_ref = []
         for idx, frame in enumerate(frames):
             cam_name = os.path.join(path, frame["file_path"] + extension)
 
@@ -193,6 +247,12 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
             # get the world-to-camera transform and set R, T
             w2c = np.linalg.inv(c2w)
+            pose_ref.append(w2c)
+
+            if noise_pertub:
+                w2c = compose_pair(pose_noise[idx], w2c)
+                pose.append(w2c)
+
             R = np.transpose(w2c[:3,:3])  # R is stored transposed due to 'glm' in CUDA code
             T = w2c[:3, 3]
 
@@ -214,18 +274,23 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                             image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1]))
-            
+        if noise_pertub:
+            pose = np.stack(pose, axis=0)
+            pose_ref = np.stack(pose_ref, axis=0)
+            plot_save_poses_blender(pose, pose_ref, file_path='input_poses.png')
     return cam_infos
 
-def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
+def readNerfSyntheticInfo(path, white_background, eval, perturb, noise_r, noise_t, extension=".png"):
     print("Reading Training Transforms")
-    train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension)
+    train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension, noise_pertub=perturb, noise_r=noise_r, noise_t=noise_t)
     print("Reading Test Transforms")
-    test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension)
+    test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension, noise_pertub=False)
     
     if not eval:
         train_cam_infos.extend(test_cam_infos)
-        test_cam_infos = []
+        # inria: test_cam_infos = []
+        import random
+        test_cam_infos = random.sample(test_cam_infos, 5)
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
