@@ -26,8 +26,10 @@ from scene.my_utils import plot_save_poses_blender
 
 class CameraInfo(NamedTuple):
     uid: int
-    R: np.array
-    T: np.array
+    R_gt: np.array # c2w
+    T_gt: np.array # w2c
+    R_init: np.array
+    T_init: np.array
     FovY: np.array
     FovX: np.array
     image: np.array
@@ -55,7 +57,7 @@ def getNerfppNorm(cam_info):
     cam_centers = []
 
     for cam in cam_info:
-        W2C = getWorld2View2(cam.R, cam.T)
+        W2C = getWorld2View2(cam.R_init, cam.T_init)
         C2W = np.linalg.inv(W2C)
         cam_centers.append(C2W[:3, 3:4])
 
@@ -223,7 +225,7 @@ def compose_pair(pose_a, pose_b):
     pose_new = np.concatenate([R_new, t_new], axis=-1)  # 合并旋转矩阵和位移
     return pose_new
 
-def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png", noise_pertub=False, noise_r=None, noise_t=None):
+def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png", noise_pertub=False, noise_r=None, noise_t=None, identity=False):
     cam_infos = []
 
     with open(os.path.join(path, transformsfile)) as json_file:
@@ -249,12 +251,18 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             w2c = np.linalg.inv(c2w)
             pose_ref.append(w2c)
 
+            R_gt = np.transpose(w2c[:3,:3])  # R is stored transposed due to 'glm' in CUDA code
+            T_gt = w2c[:3, 3]
+
             if noise_pertub:
-                w2c = compose_pair(pose_noise[idx], w2c)
+                if identity:
+                    w2c = np.eye(4)
+                else:
+                    w2c = compose_pair(pose_noise[idx], w2c)
                 pose.append(w2c)
 
-            R = np.transpose(w2c[:3,:3])  # R is stored transposed due to 'glm' in CUDA code
-            T = w2c[:3, 3]
+            R_init = np.transpose(w2c[:3,:3])  # R is stored transposed due to 'glm' in CUDA code
+            T_init = w2c[:3, 3]
 
             image_path = os.path.join(path, cam_name)
             image_name = Path(cam_name).stem
@@ -272,25 +280,35 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             FovY = fovy 
             FovX = fovx
 
-            cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1]))
+            cam_infos.append(CameraInfo(
+                uid=idx, 
+                R_gt=R_gt, 
+                T_gt=T_gt, 
+                R_init=R_init, 
+                T_init=T_init, 
+                FovY=FovY, 
+                FovX=FovX, 
+                image=image,
+                image_path=image_path, 
+                image_name=image_name, 
+                width=image.size[0], 
+                height=image.size[1]
+            ))
         if noise_pertub:
             pose = np.stack(pose, axis=0)
             pose_ref = np.stack(pose_ref, axis=0)
             plot_save_poses_blender(pose, pose_ref, file_path='input_poses.png')
     return cam_infos
 
-def readNerfSyntheticInfo(path, white_background, eval, perturb, noise_r, noise_t, extension=".png"):
+def readNerfSyntheticInfo(path, white_background, eval, perturb, noise_r, noise_t, identity=False, extension=".png"):
     print("Reading Training Transforms")
-    train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension, noise_pertub=perturb, noise_r=noise_r, noise_t=noise_t)
+    train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension, noise_pertub=perturb, noise_r=noise_r, noise_t=noise_t, identity=identity)
     print("Reading Test Transforms")
     test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension, noise_pertub=False)
     
     if not eval:
         train_cam_infos.extend(test_cam_infos)
-        # inria: test_cam_infos = []
-        import random
-        test_cam_infos = random.sample(test_cam_infos, 5)
+        test_cam_infos = []
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 

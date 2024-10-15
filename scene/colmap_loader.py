@@ -172,7 +172,8 @@ def read_intrinsics_text(path):
                 width = int(elems[2])
                 height = int(elems[3])
                 params = np.array(tuple(map(float, elems[4:])))
-                cameras[camera_id] = Camera(id=camera_id, model=model,
+                # FIXEME: check if this is correct
+                cameras[camera_id] = Camera_w_o_pose(id=camera_id, model=model,
                                             width=width, height=height,
                                             params=params)
     return cameras
@@ -232,7 +233,8 @@ def read_intrinsics_binary(path_to_model_file):
             num_params = CAMERA_MODEL_IDS[model_id].num_params
             params = read_next_bytes(fid, num_bytes=8*num_params,
                                      format_char_sequence="d"*num_params)
-            cameras[camera_id] = Camera(id=camera_id,
+            # FIXEME: check if this is correct
+            cameras[camera_id] = Camera_w_o_pose(id=camera_id,
                                         model=model_name,
                                         width=width,
                                         height=height,

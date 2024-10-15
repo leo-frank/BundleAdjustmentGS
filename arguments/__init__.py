@@ -57,6 +57,10 @@ class ModelParams(ParamGroup):
         self.perturb = False
         self.noise_r = 0.07
         self.noise_t = 0.5
+        self.optimize_pose = False
+        self.rot_lr = 0.001
+        self.trans_lr = 0.001
+        self.identity = False
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -90,6 +94,7 @@ class OptimizationParams(ParamGroup):
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0002
         self.random_background = False
+        self.pose_optim_interval = 10
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

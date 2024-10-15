@@ -18,6 +18,8 @@ from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 from scene.my_utils import plot_save_poses_blender
+import torch
+import numpy as np
 
 class Scene:
 
@@ -30,6 +32,8 @@ class Scene:
         self.model_path = args.model_path
         self.loaded_iter = None
         self.gaussians = gaussians
+        self.rot_lr = args.rot_lr
+        self.trans_lr = args.trans_lr
 
         if load_iteration:
             if load_iteration == -1:
@@ -45,7 +49,7 @@ class Scene:
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
-            scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval, args.perturb, args.noise_r, args.noise_t)
+            scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval, args.perturb, args.noise_r, args.noise_t, args.identity)
         else:
             assert False, "Could not recognize scene type!"
 
@@ -92,3 +96,32 @@ class Scene:
 
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]
+    
+    def getTrainingPoseOptimizers(self, scale=1.0):
+        opt_params = []
+        for viewpoint in self.train_cameras[scale]:
+            opt_params.append(
+                {
+                    "params": [viewpoint.cam_rot_delta],
+                    "lr": self.rot_lr,
+                    "name": "rot_{}".format(viewpoint.uid),
+                }
+            )
+            opt_params.append(
+                {
+                    "params": [viewpoint.cam_trans_delta],
+                    "lr": self.trans_lr,
+                    "name": "trans_{}".format(viewpoint.uid),
+                }
+            )
+        return torch.optim.Adam(opt_params)
+
+    def getAllTrainingPoses(self, scale=1.0):
+        '''
+        return:
+            poses_pred, w2c
+            poses_gt, w2c
+        '''
+        poses_gt = [np.hstack([viewpoint.R_gt.transpose(), viewpoint.T_gt[:, np.newaxis]]) for viewpoint in self.train_cameras[scale]]
+        poses = [np.hstack([viewpoint.R.cpu().numpy().transpose(), viewpoint.T.cpu().numpy()[:, np.newaxis]]) for viewpoint in self.train_cameras[scale]]
+        return np.stack(poses, axis=0), np.stack(poses_gt, axis=0)

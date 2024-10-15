@@ -20,6 +20,8 @@ from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
+from utils.pose_utils import update_pose
+from scene.my_utils import prealign_cameras, plot_save_poses_blender, evaluate_camera_alignment
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 try:
@@ -44,25 +46,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
-    viewpoint_stack = None
+    viewpoint_stack = scene.getTrainCameras()
+    frame_num = len(viewpoint_stack)
+    if dataset.optimize_pose:
+        poses_optimzer = scene.getTrainingPoseOptimizers()
+    if dataset.optimize_pose:
+        render_func = gaussian_renderer.render_w_pose
+    else:
+        render_func = gaussian_renderer.render
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):        
-        if network_gui.conn == None:
-            network_gui.try_connect()
-        while network_gui.conn != None:
-            try:
-                net_image_bytes = None
-                custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
-                if custom_cam != None:
-                    net_image = gaussian_renderer.render(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
-                    net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
-                network_gui.send(net_image_bytes, dataset.source_path)
-                if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
-                    break
-            except Exception as e:
-                network_gui.conn = None
 
         iter_start.record()
 
@@ -73,9 +68,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             gaussians.oneupSHdegree()
 
         # Pick a random Camera
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+        random_key = randint(0, frame_num-1)
+        viewpoint_cam = viewpoint_stack[random_key]
 
         # Render
         if (iteration - 1) == debug_from:
@@ -83,7 +77,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        render_pkg = gaussian_renderer.render(viewpoint_cam, gaussians, pipe, bg)
+        render_pkg = render_func(viewpoint_cam, gaussians, pipe, bg)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         # Loss
@@ -104,7 +98,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, gaussian_renderer.render, (pipe, background))
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render_func, (pipe, background), optimize_pose=dataset.optimize_pose)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -126,6 +120,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
+            
+            if iteration % opt.pose_optim_interval == 0 and dataset.optimize_pose:
+                poses_optimzer.step()
+                poses_optimzer.zero_grad(set_to_none = True)
+                for cam_idx in range(frame_num):
+                    viewpoint = viewpoint_stack[cam_idx]
+                    if viewpoint.uid == 0:
+                        continue
+                    update_pose(viewpoint)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
@@ -153,7 +156,7 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, optimize_pose):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -162,7 +165,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
     # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
+        validation_configs = ({'name': 'test', 'cameras' : [scene.getTestCameras()[idx % len(scene.getTestCameras())] for idx in range(5, 30, 5)]}, 
                               {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
 
         for config in validation_configs:
@@ -188,6 +191,19 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
+        
+        if optimize_pose:
+            pose, pose_ref = scene.getAllTrainingPoses()
+            try:
+                pose_aligned, sim3 = prealign_cameras(pose, pose_ref)
+                file_path=scene.model_path + '/training_poses/iteration_{}.png'.format(iteration)
+                os.makedirs(os.path.dirname(file_path), exist_ok=True)
+                plot_save_poses_blender(pose_aligned, pose_ref, file_path)
+                error = evaluate_camera_alignment(pose_aligned, pose_ref)
+                tb_writer.add_scalar('train/error_R', error.R.mean(), iteration)
+                tb_writer.add_scalar('train/error_t', error.t.mean(), iteration)
+            except Exception as e:
+                print(f"SVD did not converge")
         torch.cuda.empty_cache()
 
 if __name__ == "__main__":
@@ -200,7 +216,7 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[500 * i for i in range(op.iterations // 500 + 1)])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[1] + [500 * i for i in range(op.iterations // 500 + 1)])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[1000 * i for i in range(op.iterations // 1000 + 1)])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])

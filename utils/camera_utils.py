@@ -9,7 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
-from scene.cameras import Camera
+from scene.cameras import Camera_w_pose, Camera_w_o_pose
 import numpy as np
 from utils.general_utils import PILtoTorch
 from utils.graphics_utils import fov2focal
@@ -46,10 +46,34 @@ def loadCam(args, id, cam_info, resolution_scale):
     if resized_image_rgb.shape[1] == 4:
         loaded_mask = resized_image_rgb[3:4, ...]
 
-    return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
-                  FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
-                  image=gt_image, gt_alpha_mask=loaded_mask,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device)
+    if args.optimize_pose:
+        return Camera_w_pose(
+            colmap_id=cam_info.uid, 
+            R_gt=cam_info.R_gt, 
+            T_gt=cam_info.T_gt, 
+            R_init=cam_info.R_init, 
+            T_init=cam_info.T_init, 
+            FoVx=cam_info.FovX, 
+            FoVy=cam_info.FovY, 
+            image=gt_image, 
+            gt_alpha_mask=loaded_mask,
+            image_name=cam_info.image_name, 
+            uid=id, 
+            data_device=args.data_device
+        )
+    else:
+        return Camera_w_o_pose(
+            colmap_id=cam_info.uid, 
+            R=cam_info.R_init, # init pose may be perturbed 
+            T=cam_info.T_init, 
+            FoVx=cam_info.FovX, 
+            FoVy=cam_info.FovY, 
+            image=gt_image, 
+            gt_alpha_mask=loaded_mask,
+            image_name=cam_info.image_name, 
+            uid=id, 
+            data_device=args.data_device
+        )
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []
@@ -59,10 +83,10 @@ def cameraList_from_camInfos(cam_infos, resolution_scale, args):
 
     return camera_list
 
-def camera_to_JSON(id, camera : Camera):
+def camera_to_JSON(id, camera):
     Rt = np.zeros((4, 4))
-    Rt[:3, :3] = camera.R.transpose()
-    Rt[:3, 3] = camera.T
+    Rt[:3, :3] = camera.R_init.transpose()
+    Rt[:3, 3] = camera.T_init
     Rt[3, 3] = 1.0
 
     W2C = np.linalg.inv(Rt)
